@@ -230,3 +230,5 @@ modules/
 /output
 /_gsdata_
 .env
+*.iml
+/backend/.idea
