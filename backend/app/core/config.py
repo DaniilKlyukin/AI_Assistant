@@ -1,4 +1,5 @@
-import os
+from typing import Optional
+
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
@@ -8,6 +9,8 @@ BACKEND_DIR = ROOT_DIR / "backend"
 class Settings(BaseSettings):
     MODEL: str = "ollama/qwen3:8b"
     API_BASE: str = "http://localhost:11434"
+    OLLAMA_API_KEY: Optional[str] = None
+    ROOT_FOLDER: Path = BACKEND_DIR / "storage"
 
     ROOT_FOLDER: Path = BACKEND_DIR / "storage"
     DB_PATH: Path = BACKEND_DIR / "data" / "assistant.db"

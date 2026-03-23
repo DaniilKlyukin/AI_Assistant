@@ -229,3 +229,4 @@ modules/
 *.identcache
 /output
 /_gsdata_
+.env

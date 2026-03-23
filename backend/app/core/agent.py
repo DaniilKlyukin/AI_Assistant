@@ -95,6 +95,7 @@ class AIAgent:
                 messages=messages,
                 tools=self.tools.get_tool_schemas(),
                 api_base=self.api_base,
+                api_key=settings.OLLAMA_API_KEY,
                 temperature=temperature,
                 top_p=top_p
             )
