@@ -25,6 +25,9 @@ class AIAgent:
             "search_files": self.tools.search_files,
             "get_project_tree": self.tools.get_project_tree,
             "find_in_files": self.tools.find_in_files,
+            "get_system_info": self.tools.get_system_info,
+            "patch_file": self.tools.patch_file,
+            "fetch_web_page": self.tools.fetch_web_page,
         }
 
     def _prepare_message_for_db(self, msg_obj) -> Dict:
@@ -36,7 +39,7 @@ class AIAgent:
         return {k: v for k, v in msg_dict.items() if k in allowed_keys}
 
     async def run_cycle(self, user_input: str, history: List[Dict], current_dir: Path,
-                        temperature: float = 0.1, top_p: float = 0.9, max_iterations: int = 8) -> Tuple[
+                        temperature: float = 0.3, top_p: float = 0.8, max_iterations: int = 20) -> Tuple[
         str, List[Dict], Optional[Path]]:
         new_dir = None
         new_messages = []
@@ -48,7 +51,7 @@ class AIAgent:
         system_prompt = (
             """Ты — автономный ИИ-агент, работающий в операционной системе пользователя. 
             Твоя задача: эффективно и безопасно выполнять задания по программированию, администрированию и управлению файлами.
-            
+
             ### ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
             Тебе доступны следующие функции для взаимодействия с системой:
             1. list_directory(path): Список файлов в папке.
@@ -59,25 +62,18 @@ class AIAgent:
             6. search_files(pattern): Поиск файлов по названию (маске).
             7. find_in_files(text): Поиск строки текста внутри всех файлов.
             8. set_working_directory(new_path): Смена текущей рабочей директории.
-            
+
             ### ПРАВИЛА РАБОТЫ:
-            1. План действий (Thought): Перед каждым вызовом инструмента обязательно пиши блок <thought>, где объясняешь:
-               - Что ты собираешься сделать и зачем.
-               - Какие риски существуют (например, при выполнении команд или перезаписи файлов).
-            2. Безопасность прежде всего:
-               - Перед изменением файла (write_file) ВСЕГДА читай его (read_file), чтобы сохранить важные части кода.
-               - Не используй команды удаления (rm, del), если это не было явно запрошено.
-            3. Целостность данных: 
-               - При записи файла функцией `write_file` ты ДОЛЖЕН передавать ВЕСЬ контент файла целиком. 
-               - НИКОГДА не используй заполнители вроде "// остальной код без изменений" или "...". Это сломает файл.
-            4. Контекст:
-               - Если ты не знаешь, что находится в папке, начни с `get_project_tree` или `list_directory`.
-               - Твоя текущая рабочая директория сохраняется между ходами.
-            
+            1. Действуй напрямую: Никаких долгих размышлений.
+            2. Безопасность: Перед изменением файла всегда читай его.
+            3. Целостность данных: Передавай файл целиком.
+            4. ВЫЗОВ ИНСТРУМЕНТОВ: Ты ДОЛЖЕН использовать нативный механизм вызова функций (Tool Calling API). КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ писать JSON вроде обычным текстом в ответе!
+            5. ЭКРАНИРОВАНИЕ: При вызове execute_command внутри аргумента command ВСЕГДА используй ОДИНАРНЫЕ кавычки ('), а не двойные ("), чтобы не сломать JSON-формат. Пути в Windows пиши с двойными слэшами (C:\\folder).
+
             ### ФОРМАТ ОТВЕТА:
-            1. <thought> Твои размышления </thought>
-            2. Вызов функции (через предусмотренный JSON формат инструмента).
-            
+            - Для действий: Вызывай инструменты ТОЛЬКО через системный механизм (Tool Calling API). НЕ пиши JSON вызова инструмента в основном тексте ответа!
+            - Для общения: После выполнения всех необходимых действий (или если действия не требуются), напиши краткий и понятный комментарий о проделанной работе.
+
             Будь точен, краток и профессионален. Начинай работу."""
         )
 
@@ -104,30 +100,122 @@ class AIAgent:
             if resp_obj.content and str(resp_obj.content).strip() == "{}":
                 resp_obj.content = None
 
-            # Обработка галлюцинаций (если ИИ пишет JSON текстом вместо tool_calls)
-            if not resp_obj.tool_calls and resp_obj.content:
-                json_match = re.search(r'(\{[\s\S]*?"name"[\s\S]*?"arguments"[\s\S]*?\})', resp_obj.content)
-                if json_match:
-                    try:
-                        raw_json = json_match.group(1)
-                        fake_tool_call = json.loads(raw_json)
-                        if "name" in fake_tool_call:
-                            resp_obj.tool_calls = [{
-                                "id": f"call_{i}",
-                                "type": "function",
-                                "function": {
-                                    "name": fake_tool_call.get("name"),
-                                    "arguments": json.dumps(fake_tool_call.get("arguments", {}))
-                                }
-                            }]
-                            resp_obj.content = None
-                    except:
-                        pass
-
+            # Сначала конвертируем ответ в словарь, чтобы мы могли его изменять
             msg_dict = resp_obj.model_dump(exclude_none=True)
+
+            # ЖЕЛЕЗОБЕТОННАЯ ОБРАБОТКА ГАЛЛЮЦИНАЦИЙ: перехватываем JSON, если ИИ написал его текстом
+            if not msg_dict.get("tool_calls") and msg_dict.get("content"):
+                content_str = msg_dict["content"]
+
+                # Функция для надежного извлечения JSON с учетом вложенности скобок
+                def extract_tool_json(text: str) -> Optional[Tuple[str, dict]]:
+                    start_idx = text.find('{')
+                    while start_idx != -1:
+                        count = 0
+                        found_match = False
+
+                        for i in range(start_idx, len(text)):
+                            if text[i] == '{':
+                                count += 1
+                            elif text[i] == '}':
+                                count -= 1
+
+                            if count == 0:  # Нашли закрывающую скобку главного объекта
+                                json_str = text[start_idx:i + 1]
+                                try:
+                                    parsed = json.loads(json_str)
+
+                                    # Формат 1: Обычный вызов
+                                    if "name" in parsed and "arguments" in parsed:
+                                        return json_str, parsed
+
+                                    # Формат 2: Строгий формат OpenAI/DeepSeek
+                                    if "function" in parsed and isinstance(parsed["function"], dict):
+                                        func_data = parsed["function"]
+                                        if "name" in func_data and "arguments" in func_data:
+                                            return json_str, func_data
+
+                                except json.JSONDecodeError:
+                                    # --- РЕЖИМ СПАСЕНИЯ БИТОГО JSON ---
+                                    # Срабатывает, если ИИ забыл экранировать кавычки или слэши Windows
+                                    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', json_str)
+                                    if name_match:
+                                        t_name = name_match.group(1)
+
+                                        # Жесткий парсинг execute_command (вытаскиваем команду даже с битыми кавычками)
+                                        if t_name == "execute_command":
+                                            cmd_match = re.search(r'"command"\s*:\s*"(.*)', json_str, re.DOTALL)
+                                            if cmd_match:
+                                                cmd = cmd_match.group(1)
+                                                # Отрезаем закрывающий мусор JSON (например: "} или "}} )
+                                                cmd = re.sub(r'"\s*\}?\s*\}?$', '', cmd)
+                                                return json_str, {"name": t_name, "arguments": {"command": cmd}}
+
+                                        # Жесткий парсинг для команд с путями (где ломаются слэши Windows)
+                                        for single_arg_cmd, arg_key in [("set_working_directory", "new_path"),
+                                                                        ("read_file", "path"),
+                                                                        ("search_files", "pattern")]:
+                                            if t_name == single_arg_cmd:
+                                                arg_match = re.search(rf'"{arg_key}"\s*:\s*"(.*)', json_str, re.DOTALL)
+                                                if arg_match:
+                                                    val = arg_match.group(1)
+                                                    val = re.sub(r'"\s*\}?\s*\}?$', '', val)
+                                                    return json_str, {"name": t_name, "arguments": {arg_key: val}}
+                                    # -----------------------------------
+
+                                # Если этот кусок не подошел, ищем следующую открывающую скобку
+                                found_match = True
+                                start_idx = text.find('{', i + 1)
+                                break
+
+                        if not found_match:
+                            break
+
+                    return None
+
+                extracted = extract_tool_json(content_str)
+
+                if extracted:
+                    raw_json, fake_tool_call = extracted
+
+                    try:
+                        # Обязательно переводим аргументы в строку, как того требует стандарт API
+                        args = fake_tool_call.get("arguments", {})
+                        if isinstance(args, dict):
+                            args = json.dumps(args, ensure_ascii=False)
+                        elif isinstance(args, str):
+                            # На случай если модель уже вернула аргументы как строку
+                            pass
+
+                        # Искусственно создаем правильный вызов инструмента
+                        msg_dict["tool_calls"] = [{
+                            "id": f"call_fixed_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": fake_tool_call["name"],
+                                "arguments": args
+                            }
+                        }]
+
+                        # ВЫРЕЗАЕМ этот JSON из текста
+                        clean_text = content_str.replace(raw_json, "").strip()
+
+                        # Мощная очистка от остаточного мусора (например пустых скобок массива или артефактов)
+                        clean_text = re.sub(r'(?i)Tool\s*Calls?:\s*\[\s*\]', '', clean_text).strip()
+                        clean_text = re.sub(r'^\[\s*\]$', '', clean_text).strip()
+                        clean_text = re.sub(r'```json\s*```|```\s*```', '', clean_text).strip()
+
+                        msg_dict["content"] = clean_text if clean_text else None
+
+                        logger.info(
+                            f"Успешно перехвачен текстовый JSON и конвертирован в инструмент: {fake_tool_call['name']}")
+                    except Exception as e:
+                        logger.error(f"Ошибка обработки перехваченного JSON: {e}")
+
             messages.append(msg_dict)
             new_messages.append(self._prepare_message_for_db(msg_dict))
 
+            # Если инструментов для вызова нет - прерываем цикл (модель дала окончательный ответ)
             if not msg_dict.get("tool_calls"):
                 break
 
@@ -140,7 +228,7 @@ class AIAgent:
                 except:
                     args = {}
 
-                # Защита от бесконечных циклов
+                # Защита от бесконечных циклов (повторение одной и той же команды)
                 tool_signature = f"{name}_{args_str}"
                 if tool_signature in executed_tools_history:
                     force_break = True
@@ -167,6 +255,7 @@ class AIAgent:
                     "result": clean_res
                 })
 
+                # Сообщаем модели результат выполнения функции
                 tool_res_msg = {
                     "role": "tool",
                     "tool_call_id": tool_call.get("id", f"call_{i}"),
@@ -182,29 +271,26 @@ class AIAgent:
         final_text = ""
         # 1. Ищем последний осмысленный текстовый ответ ассистента
         for msg in reversed(messages):
-            if msg.get("role") == "assistant" and msg.get("content"):
+            # Ищем сообщение с текстом, ТОЛЬКО если в нём НЕТ вызова инструмента (это значит, что это финальный ответ, а не мысли перед действием)
+            if msg.get("role") == "assistant" and msg.get("content") and not msg.get("tool_calls"):
                 content = str(msg["content"]).strip()
-                if content and content != "{}" and '{"name":' not in content:
+                if content and content != "{}":
                     final_text = content
                     break
 
-        # 2. Если ассистент промолчал, формируем отчет из выполненных действий
+        # 2. Если ассистент промолчал в конце (а только вызывал инструменты), формируем системный отчет о том, что он сделал
         if not final_text:
             if executed_actions_report:
                 report_parts = ["**Выполнены следующие действия:**"]
                 for action in executed_actions_report:
-                    # Красиво форматируем аргументы (например, command="mkdir test")
                     args_fmt = ", ".join([f'{k}="{v}"' for k, v in action['args'].items()])
                     report_parts.append(f"— Вызов `{action['tool']}({args_fmt})`")
 
-                    # Добавляем результат, если он не пустой и не стандартный
                     res = action['result']
                     if res and res != "Выполнено (без вывода).":
-                        # Ограничиваем длину вывода в отчете
                         if len(res) > 300: res = res[:300] + "..."
                         report_parts.append(f"  ```text\n  {res}\n  ```")
 
-                # Если все результаты были "без вывода", добавим общую пометку
                 if len(report_parts) == 2 and "Вызов" in report_parts[1]:
                     report_parts.append("\n*Операция завершена успешно.*")
 
